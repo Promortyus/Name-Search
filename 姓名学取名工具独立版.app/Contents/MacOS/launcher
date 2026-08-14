@@ -7,10 +7,7 @@ RESOURCES_DIR="$BUNDLE_DIR/Contents/Resources"
 APP_DIR="$RESOURCES_DIR/NameSearch"
 VENV_DIR="$RESOURCES_DIR/.venv"
 DATA_DIR="$HOME/Library/Application Support/姓名学取名工具"
-LOG_FILE="$DATA_DIR/streamlit.log"
-PORT="${NAME_SEARCH_PORT:-8502}"
-HOST="${NAME_SEARCH_HOST:-localhost}"
-URL="http://${HOST}:${PORT}"
+LOG_FILE="$DATA_DIR/desktop.log"
 
 mkdir -p "$DATA_DIR"
 
@@ -28,13 +25,7 @@ if [[ ! -f "$DATA_DIR/characters.csv" && -f "$APP_DIR/characters.csv" ]]; then
   cp "$APP_DIR/characters.csv" "$DATA_DIR/characters.csv"
 fi
 
-if command -v lsof >/dev/null 2>&1 && lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
-  open "$URL" >/dev/null 2>&1
-  exit 0
-fi
-
-open "$URL" >/dev/null 2>&1
 export NAME_SEARCH_DATA_DIR="$DATA_DIR"
 export PYTHONNOUSERSITE=1
 cd "$APP_DIR" || exit 1
-exec "$VENV_DIR/bin/python3" -m streamlit run "$APP_DIR/app.py" --server.port "$PORT" --server.address "$HOST" --server.headless true >> "$LOG_FILE" 2>&1
+exec "$VENV_DIR/bin/python3" "$APP_DIR/desktop_app.py" >> "$LOG_FILE" 2>&1

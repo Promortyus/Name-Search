@@ -3,3 +3,10 @@ pandas>=2.0
 requests>=2.32
 gspread>=6.0
 google-auth>=2.0
+pywebview==5.4
+pyobjc-core==10.3.2
+pyobjc-framework-Cocoa==10.3.2
+pyobjc-framework-WebKit==10.3.2
+pyobjc-framework-Quartz==10.3.2
+pyobjc-framework-Security==10.3.2
+pyobjc-framework-UniformTypeIdentifiers==10.3.2

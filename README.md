@@ -11,12 +11,14 @@ streamlit run app.py
 
 macOS 本地一键启动有两种：
 
-- `姓名学取名工具独立版.app`：推荐给日常使用。代码、默认字库、Python Framework 和 Python 依赖都在 app 包里，移动项目文件夹后仍可运行。
+- `姓名学取名工具独立版.app`：推荐给日常使用。代码、默认字库、Python Framework 和 Python 依赖都在 app 包里，移动项目文件夹后仍可运行。它会在 app 窗口里显示页面，不再打开浏览器。
 - `姓名学取名工具.app`：轻量启动器，会打开 Terminal 运行 `启动姓名学取名工具.command`，依赖当前项目文件夹。
 
 如果 `.app` 无法启动，也可以直接双击 `启动姓名学取名工具.command` 作为备用方式。
 
 独立版运行时会把可写字库放在 `~/Library/Application Support/姓名学取名工具/characters.csv`，不会写入 app 包内部。
+
+独立版日志在 `~/Library/Application Support/姓名学取名工具/desktop.log`。
 
 App 图标源文件在 `assets/AppIcon.png`，生成脚本在 `tools/build_app_icon.py`，成品 `.icns` 会复制到两个 `.app` 的 `Contents/Resources/AppIcon.icns`。
 
