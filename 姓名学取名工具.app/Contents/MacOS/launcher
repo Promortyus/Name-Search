@@ -1,0 +1,20 @@
+#!/bin/zsh
+set -u
+
+COMMAND_NAME="启动姓名学取名工具.command"
+PROJECT_FALLBACK="/Users/shawnlyu/Library/Mobile Documents/com~apple~CloudDocs/姓名学/Name-Search"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUNDLE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PROJECT_DIR="$(cd "$BUNDLE_DIR/.." && pwd)"
+
+if [[ -x "$PROJECT_DIR/$COMMAND_NAME" ]]; then
+  COMMAND_PATH="$PROJECT_DIR/$COMMAND_NAME"
+elif [[ -x "$PROJECT_FALLBACK/$COMMAND_NAME" ]]; then
+  COMMAND_PATH="$PROJECT_FALLBACK/$COMMAND_NAME"
+else
+  osascript -e 'display alert "找不到启动脚本" message "请把「姓名学取名工具.app」放在 Name-Search 项目文件夹里，或保留原项目路径。"' >/dev/null 2>&1
+  exit 1
+fi
+
+open "$COMMAND_PATH" >/dev/null 2>&1

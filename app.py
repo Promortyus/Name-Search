@@ -15,6 +15,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import pandas as pd
+import requests
 import streamlit as st
 
 
@@ -22,6 +23,8 @@ APP_DIR = Path(__file__).resolve().parent
 MAX_AGENT_COMBOS = 8
 MAX_MEIMINGTENG_VERIFY_CHARS = 48
 CODEX_AGENT_MODEL = os.environ.get("NAME_SEARCH_CODEX_MODEL", "gpt-5.5")
+OPENAI_API_MODEL = os.environ.get("NAME_SEARCH_OPENAI_MODEL", "gpt-5")
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 CHARACTER_DB_PATH = APP_DIR / "characters.csv"
 MEIMINGTENG_ZIDIAN_URL = "https://m.meimingteng.com/m/zidian.aspx?zi="
 GOOGLE_SHEET_ID = os.environ.get("NAME_SEARCH_GOOGLE_SHEET_ID", "")
@@ -699,7 +702,12 @@ def verify_candidate_names(
 def get_codex_status() -> dict[str, str | bool]:
     codex_path = shutil.which("codex")
     if not codex_path:
-        return {"ready": False, "message": "未检测到 codex 命令。", "path": ""}
+        return {
+            "ready": False,
+            "message": "当前运行环境未安装本机 Agent（codex CLI）。云端部署无法使用你电脑上的 ChatGPT 登录。",
+            "path": "",
+            "reason": "missing_command",
+        }
 
     try:
         result = subprocess.run(
@@ -711,7 +719,7 @@ def get_codex_status() -> dict[str, str | bool]:
             check=False,
         )
     except Exception as exc:  # noqa: BLE001 - surface local setup failures in the UI.
-        return {"ready": False, "message": f"无法检查 Codex 登录状态：{exc}", "path": codex_path}
+        return {"ready": False, "message": f"无法检查本机 Agent 登录状态：{exc}", "path": codex_path, "reason": "status_failed"}
 
     output = (result.stdout + result.stderr).strip()
     if result.returncode == 0 and "Logged in" in output:
@@ -719,8 +727,9 @@ def get_codex_status() -> dict[str, str | bool]:
 
     return {
         "ready": False,
-        "message": output or "Codex 未登录。请先在 Terminal 运行 `codex login`。",
+        "message": output or "本机 Agent 未登录。",
         "path": codex_path,
+        "reason": "not_logged_in",
     }
 
 
@@ -825,6 +834,78 @@ def summarize_codex_error(output: str, error: str) -> str:
         return "\n".join(error_lines[-8:])
 
     return "\n".join(raw.splitlines()[-20:])
+
+
+def extract_openai_response_text(payload: dict[str, object]) -> str:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    parts: list[str] = []
+    for item in payload.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []):
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def call_openai_responses_api(
+    prompt: str,
+    api_key: str,
+    model: str,
+    use_web_search: bool = True,
+    timeout_seconds: int = 180,
+) -> tuple[bool, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body: dict[str, object] = {
+        "model": model,
+        "input": prompt,
+    }
+    if use_web_search:
+        body["tools"] = [{"type": "web_search"}]
+
+    try:
+        response = requests.post(OPENAI_RESPONSES_URL, headers=headers, json=body, timeout=timeout_seconds)
+    except requests.RequestException as exc:
+        return False, f"OpenAI API 调用失败：{exc}"
+
+    if response.status_code >= 400:
+        try:
+            error_payload = response.json()
+            detail = error_payload.get("error", {}).get("message") or error_payload.get("detail") or response.text
+        except ValueError:
+            detail = response.text
+
+        if use_web_search and response.status_code in {400, 404}:
+            fallback_ok, fallback_output = call_openai_responses_api(
+                prompt,
+                api_key,
+                model,
+                use_web_search=False,
+                timeout_seconds=timeout_seconds,
+            )
+            if fallback_ok:
+                return True, fallback_output
+
+        return False, f"OpenAI API 返回错误：{detail}"
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return False, "OpenAI API 返回了无法解析的结果。"
+
+    text = extract_openai_response_text(payload)
+    if not text:
+        return False, "OpenAI API 没有返回候选内容。"
+    return True, text
 
 
 def run_codex_selection(prompt: str, timeout_seconds: int = 240) -> tuple[bool, str]:
@@ -936,6 +1017,16 @@ with st.sidebar:
     st.header("遍历范围")
     first_range = st.slider("名一笔画范围", 1, 50, (1, 50))
     second_range = st.slider("名二笔画范围", 1, 50, (1, 50))
+
+    st.header("AI 生成")
+    openai_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        value="",
+        help="仅用于当前会话生成候选，不会写入本地文件或字库。",
+    )
+    openai_api_model = st.text_input("API 模型", value=OPENAI_API_MODEL)
+    st.caption("部署版没有本机 Agent 时，可用 API Key 启用候选生成。")
 
 st.subheader("当前输入预览")
 render_sheet_preview(surname, first_name, second_name, surname_stroke, first_stroke, second_stroke)
@@ -1055,7 +1146,7 @@ edited_selection = st.data_editor(
     hide_index=True,
     disabled=display_columns,
     column_config={
-        "选择": st.column_config.CheckboxColumn("选择", help="勾选后可交给本机 Codex workflow 生成候选汉字。")
+        "选择": st.column_config.CheckboxColumn("选择", help="勾选后可交给本机 Agent 生成候选汉字。")
     },
 )
 
@@ -1069,12 +1160,21 @@ st.download_button(
 st.subheader("AI 候选汉字")
 character_db, character_db_status = load_character_db_with_status()
 codex_status = get_codex_status()
-if codex_status["ready"]:
+api_key_ready = bool(openai_api_key.strip())
+generation_mode = "codex" if codex_status["ready"] else ("openai_api" if api_key_ready else "disabled")
+
+if generation_mode == "codex":
     st.success("已检测到本机 ChatGPT 登录，可使用本地 Agent 生成候选名字")
+    st.caption(f"当前选字模型：{CODEX_AGENT_MODEL}")
+elif generation_mode == "openai_api":
+    st.success("已检测到 OpenAI API Key，可使用云端 API 生成候选名字")
+    st.caption(f"当前选字模型：{openai_api_model.strip() or OPENAI_API_MODEL}")
 else:
-    st.warning(f"本地 workflow 功能未启用：{codex_status['message']}")
-    st.caption("请先在 Terminal 运行 `codex login`，然后刷新页面。")
-st.caption(f"当前选字模型：{CODEX_AGENT_MODEL}")
+    st.warning(f"候选生成功能未启用：{codex_status['message']}")
+    if codex_status.get("reason") == "missing_command":
+        st.caption("部署版仍可使用笔画筛选和字库校验；如需生成候选，请在左侧栏输入 OpenAI API Key。")
+    else:
+        st.caption("请在运行这个 Streamlit 服务的机器上执行 `codex login`，然后刷新页面。")
 
 if not character_db_status["ok"]:
     st.warning(str(character_db_status["message"]))
@@ -1096,14 +1196,24 @@ preferences = st.text_area(
 selected_count = len(selected_rows)
 st.caption(f"已选择 {selected_count} 个笔画组合，最多建议一次选择 {MAX_AGENT_COMBOS} 个。")
 
-generate_disabled = (not codex_status["ready"]) or selected_count == 0 or selected_count > MAX_AGENT_COMBOS
+generate_disabled = generation_mode == "disabled" or selected_count == 0 or selected_count > MAX_AGENT_COMBOS
 if selected_count > MAX_AGENT_COMBOS:
     st.error(f"一次选择太多会让校验变慢。请先缩到 {MAX_AGENT_COMBOS} 个组合以内。")
 
 if st.button("生成候选", disabled=generate_disabled):
-    with st.spinner("Agent 正在按康熙笔画找候选字，随后小批量查美名腾并用本地代码校验..."):
+    spinner_text = "Agent 正在按康熙笔画找候选字，随后小批量查美名腾并用本地代码校验..."
+    if generation_mode == "openai_api":
+        spinner_text = "OpenAI API 正在按康熙笔画找候选字，随后小批量查美名腾并用本地代码校验..."
+    with st.spinner(spinner_text):
         prompt = build_selection_prompt(selected_rows, preferences, surname)
-        ok, agent_output = run_codex_selection(prompt)
+        if generation_mode == "openai_api":
+            ok, agent_output = call_openai_responses_api(
+                prompt,
+                openai_api_key.strip(),
+                openai_api_model.strip() or OPENAI_API_MODEL,
+            )
+        else:
+            ok, agent_output = run_codex_selection(prompt)
     if ok:
         try:
             with st.spinner("正在小批量查询美名腾并补充本地字库..."):

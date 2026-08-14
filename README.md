@@ -9,6 +9,10 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+macOS 本地一键启动：双击 `姓名学取名工具.app`。应用会打开 Terminal 运行 `启动姓名学取名工具.command`；如果服务已经在 `8502` 端口运行，它会直接打开浏览器，否则会自动启动 Streamlit。
+
+如果 `.app` 无法启动，也可以直接双击 `启动姓名学取名工具.command` 作为备用方式。
+
 ## 当前公式
 
 - 天格 = 姓氏笔画 + 1
@@ -33,6 +37,14 @@ streamlit run app.py
 
 ```bash
 export NAME_SEARCH_CODEX_MODEL=gpt-5.6-sol
+```
+
+部署到 Streamlit Cloud 后，应用运行在云端容器里，不能复用你本机 Terminal 的 `codex login` 或 `codex` 命令。因此部署版默认只能使用笔画筛选和字库校验。
+
+如果要在部署版生成候选，可在左侧栏临时输入 OpenAI API Key。这个 Key 只保存在当前 Streamlit 会话里，不写入文件或字库；请求会从部署的 Streamlit 后端发往 OpenAI API。默认 API 模型是 `gpt-5`，可通过环境变量覆盖：
+
+```bash
+export NAME_SEARCH_OPENAI_MODEL=gpt-5
 ```
 
 ### Google Sheets 字库
