@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import textwrap
 import time
+from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
 from urllib.parse import quote
@@ -23,6 +24,15 @@ MAX_MEIMINGTENG_VERIFY_CHARS = 48
 CODEX_AGENT_MODEL = os.environ.get("NAME_SEARCH_CODEX_MODEL", "gpt-5.5")
 CHARACTER_DB_PATH = APP_DIR / "characters.csv"
 MEIMINGTENG_ZIDIAN_URL = "https://m.meimingteng.com/m/zidian.aspx?zi="
+GOOGLE_SHEET_ID = os.environ.get("NAME_SEARCH_GOOGLE_SHEET_ID", "")
+GOOGLE_SERVICE_ACCOUNT_FILE = os.environ.get(
+    "NAME_SEARCH_GOOGLE_SERVICE_ACCOUNT_FILE",
+    os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""),
+)
+GOOGLE_CHARACTERS_WORKSHEET = os.environ.get("NAME_SEARCH_GOOGLE_CHARACTERS_WORKSHEET", "characters")
+GOOGLE_LOG_WORKSHEET = os.environ.get("NAME_SEARCH_GOOGLE_LOG_WORKSHEET", "verification_log")
+CHARACTER_COLUMNS = ["char", "name_strokes", "wuxing", "pinyin", "source", "verify_count", "last_verified_at", "status"]
+VERIFICATION_LOG_COLUMNS = ["char", "name_strokes", "wuxing", "pinyin", "source", "source_url", "verified_at", "result", "error"]
 
 
 STEMS = {
@@ -176,20 +186,88 @@ def exclude_by_targets(df: pd.DataFrame, column: str, raw_value: str) -> pd.Data
     return df[~df[column].isin(targets)]
 
 
-@st.cache_data(ttl=60)
-def load_character_db() -> pd.DataFrame:
-    if not CHARACTER_DB_PATH.exists():
-        return pd.DataFrame(columns=["char", "name_strokes", "wuxing", "pinyin", "source"])
+def google_sheets_configured() -> bool:
+    return bool(GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_FILE)
 
-    df = pd.read_csv(CHARACTER_DB_PATH)
-    expected_columns = ["char", "name_strokes", "wuxing", "pinyin", "source"]
-    for col in expected_columns:
+
+def normalize_character_db(df: pd.DataFrame) -> pd.DataFrame:
+    for col in CHARACTER_COLUMNS:
         if col not in df.columns:
             df[col] = ""
 
+    df = df[CHARACTER_COLUMNS].copy()
     df["char"] = df["char"].astype(str)
     df["name_strokes"] = pd.to_numeric(df["name_strokes"], errors="coerce").astype("Int64")
-    return df[expected_columns]
+    df["verify_count"] = pd.to_numeric(df["verify_count"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+def load_local_character_db() -> pd.DataFrame:
+    if not CHARACTER_DB_PATH.exists():
+        return normalize_character_db(pd.DataFrame(columns=CHARACTER_COLUMNS))
+
+    return normalize_character_db(pd.read_csv(CHARACTER_DB_PATH))
+
+
+def get_google_spreadsheet():
+    try:
+        import gspread
+    except ImportError as exc:
+        raise RuntimeError("未安装 Google Sheets 依赖，请先运行 `pip install -r requirements.txt`。") from exc
+
+    client = gspread.service_account(filename=GOOGLE_SERVICE_ACCOUNT_FILE)
+    return client.open_by_key(GOOGLE_SHEET_ID)
+
+
+def get_or_create_worksheet(spreadsheet, title: str, columns: list[str]):
+    from gspread.exceptions import WorksheetNotFound
+
+    try:
+        worksheet = spreadsheet.worksheet(title)
+    except WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=title, rows=1000, cols=max(len(columns), 8))
+        worksheet.append_row(columns)
+        return worksheet
+
+    rows = worksheet.get_all_values()
+    if not rows:
+        worksheet.append_row(columns)
+    return worksheet
+
+
+def load_google_character_db() -> pd.DataFrame:
+    spreadsheet = get_google_spreadsheet()
+    worksheet = get_or_create_worksheet(spreadsheet, GOOGLE_CHARACTERS_WORKSHEET, CHARACTER_COLUMNS)
+    rows = worksheet.get_all_records()
+    return normalize_character_db(pd.DataFrame(rows))
+
+
+@st.cache_data(ttl=60)
+def load_character_db_with_status() -> tuple[pd.DataFrame, dict[str, object]]:
+    if google_sheets_configured():
+        try:
+            return load_google_character_db(), {
+                "backend": "google_sheets",
+                "ok": True,
+                "message": "Google Sheets 字库已连接",
+            }
+        except Exception as exc:  # noqa: BLE001 - keep app usable if cloud sync fails.
+            return load_local_character_db(), {
+                "backend": "local_csv",
+                "ok": False,
+                "message": f"Google Sheets 字库连接失败，已回落本地字库：{exc}",
+            }
+
+    return load_local_character_db(), {
+        "backend": "local_csv",
+        "ok": True,
+        "message": "本地 CSV 字库",
+    }
+
+
+def load_character_db() -> pd.DataFrame:
+    character_db, _status = load_character_db_with_status()
+    return character_db
 
 
 def character_lookup(character_db: pd.DataFrame) -> dict[str, dict[str, object]]:
@@ -250,6 +328,7 @@ def parse_meimingteng_char(page_html: str, char: str) -> dict[str, object]:
             "pinyin": None,
             "verified": False,
             "source": "meimingteng",
+            "source_url": MEIMINGTENG_ZIDIAN_URL + quote(char),
         }
 
     window = match.group(0)
@@ -262,6 +341,7 @@ def parse_meimingteng_char(page_html: str, char: str) -> dict[str, object]:
         "pinyin": pinyin_match.group(0) if pinyin_match else "",
         "verified": True,
         "source": "meimingteng",
+        "source_url": MEIMINGTENG_ZIDIAN_URL + quote(char),
     }
 
 
@@ -282,6 +362,7 @@ def verify_meimingteng_chars(chars: list[str], batch_size: int = 4, delay: float
                     "pinyin": None,
                     "verified": False,
                     "source": "meimingteng",
+                    "source_url": MEIMINGTENG_ZIDIAN_URL + quote(char),
                     "error": str(exc),
                 }
                 for char in batch
@@ -303,8 +384,140 @@ def display_stroke(value: object) -> int | str:
     return int(value)
 
 
-def upsert_verified_characters(rows: list[dict[str, object]]) -> int:
-    expected_columns = ["char", "name_strokes", "wuxing", "pinyin", "source"]
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def merge_sources(existing_source: object, new_source: object) -> str:
+    sources = []
+    for raw in [existing_source, new_source]:
+        for item in str(raw or "").replace("，", ",").replace(";", ",").split(","):
+            source = item.strip()
+            if source and source not in sources:
+                sources.append(source)
+    return ";".join(sources)
+
+
+def safe_int(value: object, default: int = 0) -> int:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def append_google_verification_logs(worksheet, rows: list[dict[str, object]], result_overrides: dict[str, str]) -> None:
+    now = utc_now_iso()
+    log_rows = []
+    for row in rows:
+        char = str(row.get("char", "")).strip()
+        if not char:
+            continue
+        result = result_overrides.get(char) or ("verified" if row.get("verified") else "failed")
+        log_rows.append(
+            [
+                char,
+                row.get("name_strokes", "") or "",
+                row.get("wuxing", "") or "",
+                row.get("pinyin", "") or "",
+                row.get("source", "") or "",
+                row.get("source_url", "") or "",
+                now,
+                result,
+                row.get("error", "") or "",
+            ]
+        )
+    if log_rows:
+        worksheet.append_rows(log_rows, value_input_option="USER_ENTERED")
+
+
+def upsert_google_verified_characters(rows: list[dict[str, object]]) -> int:
+    spreadsheet = get_google_spreadsheet()
+    characters_sheet = get_or_create_worksheet(spreadsheet, GOOGLE_CHARACTERS_WORKSHEET, CHARACTER_COLUMNS)
+    log_sheet = get_or_create_worksheet(spreadsheet, GOOGLE_LOG_WORKSHEET, VERIFICATION_LOG_COLUMNS)
+
+    existing_rows = characters_sheet.get_all_records()
+    existing_by_char = {str(row.get("char", "")).strip(): (idx + 2, row) for idx, row in enumerate(existing_rows)}
+    changed = 0
+    result_overrides: dict[str, str] = {}
+    now = utc_now_iso()
+
+    for row in rows:
+        char = str(row.get("char", "")).strip()
+        if not char or not row.get("verified") or row.get("name_strokes") is None:
+            continue
+
+        new_strokes = safe_int(row.get("name_strokes"))
+        new_source = row.get("source", "") or "meimingteng"
+        if char in existing_by_char:
+            row_number, existing = existing_by_char[char]
+            existing_strokes = safe_int(existing.get("name_strokes"), default=-1)
+            verify_count = safe_int(existing.get("verify_count")) + 1
+
+            if existing_strokes == -1 or str(existing.get("name_strokes", "")).strip() == "":
+                updated = [
+                    char,
+                    new_strokes,
+                    row.get("wuxing", "") or existing.get("wuxing", "") or "",
+                    row.get("pinyin", "") or existing.get("pinyin", "") or "",
+                    merge_sources(existing.get("source", ""), new_source),
+                    verify_count,
+                    now,
+                    "verified",
+                ]
+                result_overrides[char] = "verified"
+            elif existing_strokes == new_strokes:
+                updated = [
+                    char,
+                    existing_strokes,
+                    existing.get("wuxing", "") or row.get("wuxing", "") or "",
+                    existing.get("pinyin", "") or row.get("pinyin", "") or "",
+                    merge_sources(existing.get("source", ""), new_source),
+                    verify_count,
+                    now,
+                    existing.get("status", "") or "verified",
+                ]
+                result_overrides[char] = "duplicate_verified"
+            else:
+                updated = [
+                    char,
+                    existing.get("name_strokes", ""),
+                    existing.get("wuxing", ""),
+                    existing.get("pinyin", ""),
+                    merge_sources(existing.get("source", ""), new_source),
+                    verify_count,
+                    now,
+                    "conflict",
+                ]
+                result_overrides[char] = "conflict"
+
+            characters_sheet.update(f"A{row_number}:H{row_number}", [updated], value_input_option="USER_ENTERED")
+            changed += 1
+        else:
+            new_row = [
+                char,
+                new_strokes,
+                row.get("wuxing", "") or "",
+                row.get("pinyin", "") or "",
+                new_source,
+                1,
+                now,
+                "verified",
+            ]
+            characters_sheet.append_row(new_row, value_input_option="USER_ENTERED")
+            existing_by_char[char] = (len(existing_by_char) + 2, dict(zip(CHARACTER_COLUMNS, new_row)))
+            result_overrides[char] = "inserted"
+            changed += 1
+
+    append_google_verification_logs(log_sheet, rows, result_overrides)
+    if changed:
+        load_character_db_with_status.clear()
+    return changed
+
+
+def upsert_local_verified_characters(rows: list[dict[str, object]]) -> int:
+    expected_columns = CHARACTER_COLUMNS
     if CHARACTER_DB_PATH.exists():
         character_db = pd.read_csv(CHARACTER_DB_PATH)
     else:
@@ -328,6 +541,9 @@ def upsert_verified_characters(rows: list[dict[str, object]]) -> int:
             "wuxing": row.get("wuxing", "") or "",
             "pinyin": row.get("pinyin", "") or "",
             "source": row.get("source", "") or "meimingteng",
+            "verify_count": 1,
+            "last_verified_at": utc_now_iso(),
+            "status": "verified",
         }
         if not new_row["char"]:
             continue
@@ -339,15 +555,37 @@ def upsert_verified_characters(rows: list[dict[str, object]]) -> int:
                 if pd.isna(current_value) or str(current_value).strip() == "":
                     character_db.at[idx, col] = value
                     changed += 1
+            existing_strokes = safe_int(character_db.at[idx, "name_strokes"], default=-1)
+            new_strokes = safe_int(new_row["name_strokes"], default=-1)
+            if existing_strokes == new_strokes:
+                character_db.at[idx, "verify_count"] = safe_int(character_db.at[idx, "verify_count"]) + 1
+                character_db.at[idx, "last_verified_at"] = utc_now_iso()
+                character_db.at[idx, "source"] = merge_sources(character_db.at[idx, "source"], new_row["source"])
+                character_db.at[idx, "status"] = character_db.at[idx, "status"] or "verified"
+                changed += 1
+            elif existing_strokes != -1 and new_strokes != -1:
+                character_db.at[idx, "status"] = "conflict"
+                character_db.at[idx, "last_verified_at"] = utc_now_iso()
+                changed += 1
         else:
             character_db.loc[len(character_db)] = new_row
             existing_chars[new_row["char"]] = len(character_db) - 1
             changed += 1
 
     if changed:
-        character_db.to_csv(CHARACTER_DB_PATH, index=False, encoding="utf-8")
-        load_character_db.clear()
+        normalize_character_db(character_db).to_csv(CHARACTER_DB_PATH, index=False, encoding="utf-8")
+        load_character_db_with_status.clear()
     return changed
+
+
+def upsert_verified_characters(rows: list[dict[str, object]]) -> tuple[int, str]:
+    if google_sheets_configured():
+        try:
+            return upsert_google_verified_characters(rows), "google_sheets"
+        except Exception:
+            return upsert_local_verified_characters(rows), "local_csv"
+
+    return upsert_local_verified_characters(rows), "local_csv"
 
 
 def extract_json_payload(raw_text: str) -> object:
@@ -829,7 +1067,7 @@ st.download_button(
 )
 
 st.subheader("AI 候选汉字")
-character_db = load_character_db()
+character_db, character_db_status = load_character_db_with_status()
 codex_status = get_codex_status()
 if codex_status["ready"]:
     st.success("已检测到本机 ChatGPT 登录，可使用本地 Agent 生成候选名字")
@@ -838,8 +1076,13 @@ else:
     st.caption("请先在 Terminal 运行 `codex login`，然后刷新页面。")
 st.caption(f"当前选字模型：{CODEX_AGENT_MODEL}")
 
+if not character_db_status["ok"]:
+    st.warning(str(character_db_status["message"]))
+
 if character_db.empty:
-    st.warning("未找到本地字库 `characters.csv`，生成结果只能标为未校验。")
+    st.warning("未找到可用字库，生成结果只能标为未校验。")
+elif character_db_status["backend"] == "google_sheets":
+    st.caption(f"云端字库已加载 {len(character_db)} 个字；已完成姓名学笔画验证")
 else:
     st.caption(f"本地字库已加载 {len(character_db)} 个字；已完成姓名学笔画验证")
 
@@ -870,9 +1113,9 @@ if st.button("生成候选", disabled=generate_disabled):
                 known_chars = set(character_db["char"].astype(str)) if not character_db.empty else set()
                 unknown_chars = [char for char in candidate_chars if char not in known_chars]
                 meimingteng_results = verify_meimingteng_chars(unknown_chars) if unknown_chars else []
-                upsert_count = upsert_verified_characters(meimingteng_results)
+                upsert_count, storage_backend = upsert_verified_characters(meimingteng_results)
                 if upsert_count:
-                    character_db = load_character_db()
+                    character_db, character_db_status = load_character_db_with_status()
                 verified_df = verify_candidate_names(candidates, selected_rows, surname, character_db)
         except Exception as exc:  # noqa: BLE001 - show parse/verification failures in the UI.
             st.error(f"模型输出解析失败：{exc}")
@@ -883,10 +1126,11 @@ if st.button("生成候选", disabled=generate_disabled):
                 verification_errors = sorted({str(row.get("error", "")) for row in meimingteng_results if row.get("error")})
                 st.caption(
                     f"美名腾小批量验证：尝试 {min(len(unknown_chars), MAX_MEIMINGTENG_VERIFY_CHARS)} 个未知字，"
-                    f"确认 {verified_count} 个，写入/补全 {upsert_count} 处本地字库字段。"
+                    f"确认 {verified_count} 个，写入/补全 {upsert_count} 处"
+                    f"{'云端字库' if storage_backend == 'google_sheets' else '本地字库'}字段。"
                 )
                 if verification_errors:
-                    st.caption(f"外部验证失败示例：{verification_errors[0]}。已回落到本地字库结果。")
+                    st.caption(f"外部验证失败示例：{verification_errors[0]}。已回落到当前字库结果。")
                 if len(unknown_chars) > MAX_MEIMINGTENG_VERIFY_CHARS:
                     st.caption(f"另有 {len(unknown_chars) - MAX_MEIMINGTENG_VERIFY_CHARS} 个未知字本次未查询。")
             st.dataframe(verified_df, width="stretch", hide_index=True)

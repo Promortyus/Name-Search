@@ -26,8 +26,8 @@ streamlit run app.py
 
 1. 本机 `codex --search exec` 根据勾选的笔画组合，优先从康熙笔画索引页按笔画找候选字。
 2. Agent 按名字偏好筛掉明显不适合取名的字，再组合成候选名字。
-3. 本地 harness 只对候选字做美名腾小批量事实查询，补充 `characters.csv`。
-4. 本地代码读取 `characters.csv`，用确定性字库校验每个候选字的姓名学笔画。
+3. 本地 harness 只对候选字做美名腾小批量事实查询，补充 Google Sheets 云端字库；未配置云端时补充 `characters.csv`。
+4. 本地代码读取云端字库或 `characters.csv`，用确定性字库校验每个候选字的姓名学笔画。
 
 默认选字模型是 `gpt-5.5`。如果本机 Codex 升级后想切到更强模型，可在启动 Streamlit 前设置：
 
@@ -35,11 +35,31 @@ streamlit run app.py
 export NAME_SEARCH_CODEX_MODEL=gpt-5.6-sol
 ```
 
-`characters.csv` 字段：
+### Google Sheets 字库
 
-```csv
-char,name_strokes,wuxing,pinyin,source
-宛,8,土,wan,manual
+配置下面两个环境变量后，工具会优先使用 Google Sheets：
+
+```bash
+export NAME_SEARCH_GOOGLE_SHEET_ID=你的表格ID
+export NAME_SEARCH_GOOGLE_SERVICE_ACCOUNT_FILE=/path/to/service-account.json
 ```
 
-`characters.csv` 可以增量维护：每次把美名腾或其他可信来源验证过的字加入本地字库。候选字不在 `characters.csv` 中时，结果会显示为“未收录”，不会假装校验通过。美名腾查询只用于当前候选字的小批量核验，不做全量抓取；如果外部站点拒绝命令行访问，工具会回落到本地字库，不绕过限制。
+把这张 Google Sheet 共享给 service account 的邮箱。工具会自动使用/创建两张 worksheet：
+
+- `characters`：正式字库，一字一行，按 `char` 自动去重。
+- `verification_log`：验证日志，每次外部验证都会追加记录。
+
+自动去重规则：
+
+- 同一个字、同一个姓名学笔画：更新验证次数、来源和最后验证时间。
+- 同一个字、不同姓名学笔画：不覆盖原值，标记为 `conflict`。
+- 外部验证失败：只写日志，不进正式字库。
+
+未配置 Google Sheets 时，会回落到本地 `characters.csv`。本地字段：
+
+```csv
+char,name_strokes,wuxing,pinyin,source,verify_count,last_verified_at,status
+宛,8,土,wan,manual,1,2026-08-14T00:00:00+00:00,verified
+```
+
+美名腾查询只用于当前候选字的小批量核验，不做全量抓取；如果外部站点拒绝命令行访问，工具会回落到当前字库，不绕过限制。
