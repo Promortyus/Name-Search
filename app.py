@@ -1,7 +1,28 @@
 from __future__ import annotations
 
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import textwrap
+import time
+from html import unescape
+from pathlib import Path
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
 import pandas as pd
 import streamlit as st
+
+
+APP_DIR = Path(__file__).resolve().parent
+MAX_AGENT_COMBOS = 8
+MAX_MEIMINGTENG_VERIFY_CHARS = 48
+CODEX_AGENT_MODEL = os.environ.get("NAME_SEARCH_CODEX_MODEL", "gpt-5.5")
+CHARACTER_DB_PATH = APP_DIR / "characters.csv"
+MEIMINGTENG_ZIDIAN_URL = "https://m.meimingteng.com/m/zidian.aspx?zi="
 
 
 STEMS = {
@@ -153,6 +174,474 @@ def exclude_by_targets(df: pd.DataFrame, column: str, raw_value: str) -> pd.Data
         return df
     targets = parse_targets(raw_value)
     return df[~df[column].isin(targets)]
+
+
+@st.cache_data(ttl=60)
+def load_character_db() -> pd.DataFrame:
+    if not CHARACTER_DB_PATH.exists():
+        return pd.DataFrame(columns=["char", "name_strokes", "wuxing", "pinyin", "source"])
+
+    df = pd.read_csv(CHARACTER_DB_PATH)
+    expected_columns = ["char", "name_strokes", "wuxing", "pinyin", "source"]
+    for col in expected_columns:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["char"] = df["char"].astype(str)
+    df["name_strokes"] = pd.to_numeric(df["name_strokes"], errors="coerce").astype("Int64")
+    return df[expected_columns]
+
+
+def character_lookup(character_db: pd.DataFrame) -> dict[str, dict[str, object]]:
+    lookup: dict[str, dict[str, object]] = {}
+    for row in character_db.to_dict(orient="records"):
+        char = str(row.get("char", "")).strip()
+        if char:
+            lookup[char] = row
+    return lookup
+
+
+def collect_candidate_chars(candidates: list[dict[str, object]]) -> list[str]:
+    seen: set[str] = set()
+    chars: list[str] = []
+    for candidate in candidates:
+        for key in ("first_char", "second_char"):
+            char = str(candidate.get(key, "")).strip()
+            if char and char not in seen:
+                seen.add(char)
+                chars.append(char)
+    return chars
+
+
+def strip_html_tags(value: str) -> str:
+    value = re.sub(r"<script.*?</script>", "", value, flags=re.S | re.I)
+    value = re.sub(r"<style.*?</style>", "", value, flags=re.S | re.I)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = unescape(value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def fetch_meimingteng_page(chars: str, timeout: int = 15) -> str:
+    request = Request(
+        MEIMINGTENG_ZIDIAN_URL + quote(chars),
+        headers={
+            "User-Agent": "Mozilla/5.0 name-search-local-harness/1.0",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def parse_meimingteng_char(page_html: str, char: str) -> dict[str, object]:
+    compact = strip_html_tags(page_html)
+    match = re.search(re.escape(char) + r".{0,220}?(\d{1,2})\|(\d{1,2}).{0,120}", compact)
+    if not match:
+        return {
+            "char": char,
+            "name_strokes": None,
+            "wuxing": None,
+            "pinyin": None,
+            "verified": False,
+            "source": "meimingteng",
+        }
+
+    window = match.group(0)
+    wuxing_match = re.search(r"[金木水火土]", window)
+    pinyin_match = re.search(r"\b[a-züv:]{1,12}\b", window, flags=re.I)
+    return {
+        "char": char,
+        "name_strokes": int(match.group(2)),
+        "wuxing": wuxing_match.group(0) if wuxing_match else "",
+        "pinyin": pinyin_match.group(0) if pinyin_match else "",
+        "verified": True,
+        "source": "meimingteng",
+    }
+
+
+def verify_meimingteng_chars(chars: list[str], batch_size: int = 4, delay: float = 0.8) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    limited_chars = chars[:MAX_MEIMINGTENG_VERIFY_CHARS]
+    for start in range(0, len(limited_chars), batch_size):
+        batch = limited_chars[start : start + batch_size]
+        try:
+            page_html = fetch_meimingteng_page("".join(batch))
+            results.extend(parse_meimingteng_char(page_html, char) for char in batch)
+        except Exception as exc:  # noqa: BLE001 - keep optional verification resilient.
+            results.extend(
+                {
+                    "char": char,
+                    "name_strokes": None,
+                    "wuxing": None,
+                    "pinyin": None,
+                    "verified": False,
+                    "source": "meimingteng",
+                    "error": str(exc),
+                }
+                for char in batch
+            )
+        if start + batch_size < len(limited_chars):
+            time.sleep(delay)
+    return results
+
+
+def stroke_matches(value: object, target: int | None) -> bool:
+    if value is None or target is None or pd.isna(value):
+        return False
+    return int(value) == target
+
+
+def display_stroke(value: object) -> int | str:
+    if value is None or pd.isna(value):
+        return ""
+    return int(value)
+
+
+def upsert_verified_characters(rows: list[dict[str, object]]) -> int:
+    expected_columns = ["char", "name_strokes", "wuxing", "pinyin", "source"]
+    if CHARACTER_DB_PATH.exists():
+        character_db = pd.read_csv(CHARACTER_DB_PATH)
+    else:
+        character_db = pd.DataFrame(columns=expected_columns)
+
+    for col in expected_columns:
+        if col not in character_db.columns:
+            character_db[col] = ""
+
+    character_db = character_db[expected_columns].copy()
+    changed = 0
+    existing_chars = {str(char): idx for idx, char in character_db["char"].astype(str).items()}
+
+    for row in rows:
+        if not row.get("verified") or row.get("name_strokes") is None:
+            continue
+
+        new_row = {
+            "char": str(row.get("char", "")).strip(),
+            "name_strokes": row.get("name_strokes", ""),
+            "wuxing": row.get("wuxing", "") or "",
+            "pinyin": row.get("pinyin", "") or "",
+            "source": row.get("source", "") or "meimingteng",
+        }
+        if not new_row["char"]:
+            continue
+
+        if new_row["char"] in existing_chars:
+            idx = existing_chars[new_row["char"]]
+            for col, value in new_row.items():
+                current_value = character_db.at[idx, col]
+                if pd.isna(current_value) or str(current_value).strip() == "":
+                    character_db.at[idx, col] = value
+                    changed += 1
+        else:
+            character_db.loc[len(character_db)] = new_row
+            existing_chars[new_row["char"]] = len(character_db) - 1
+            changed += 1
+
+    if changed:
+        character_db.to_csv(CHARACTER_DB_PATH, index=False, encoding="utf-8")
+        load_character_db.clear()
+    return changed
+
+
+def extract_json_payload(raw_text: str) -> object:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    start = min([idx for idx in [text.find("["), text.find("{")] if idx >= 0], default=-1)
+    end = max(text.rfind("]"), text.rfind("}"))
+    if start >= 0 and end > start:
+        return json.loads(text[start : end + 1])
+    raise ValueError("模型没有返回可解析的 JSON。")
+
+
+def normalize_candidate_payload(payload: object) -> list[dict[str, object]]:
+    if isinstance(payload, dict):
+        candidates = payload.get("candidates", [])
+    else:
+        candidates = payload
+
+    if not isinstance(candidates, list):
+        raise ValueError("JSON 中缺少 candidates 列表。")
+
+    normalized = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        first_char = str(item.get("first_char", "")).strip()
+        second_char = str(item.get("second_char", "")).strip()
+        if not first_char or not second_char:
+            name = str(item.get("name", "")).strip()
+            if len(name) >= 2:
+                first_char = first_char or name[0]
+                second_char = second_char or name[1]
+        if not first_char or not second_char:
+            continue
+
+        normalized.append(
+            {
+                "combo": str(item.get("combo", "")).strip(),
+                "first_char": first_char[0],
+                "second_char": second_char[0],
+                "name": str(item.get("name", first_char[0] + second_char[0])).strip() or first_char[0] + second_char[0],
+                "candidate_source": str(item.get("candidate_source", item.get("source", ""))).strip(),
+                "wuxing_pinyin": str(item.get("wuxing_pinyin", "")).strip(),
+                "reason": str(item.get("reason", "")).strip(),
+                "notes": str(item.get("notes", "")).strip(),
+            }
+        )
+    return normalized
+
+
+def verify_candidate_names(
+    candidates: list[dict[str, object]],
+    selected_rows: pd.DataFrame,
+    surname: str,
+    character_db: pd.DataFrame,
+) -> pd.DataFrame:
+    lookup = character_lookup(character_db)
+    combo_targets = {
+        f'{int(row["名一笔画"])}-{int(row["名二笔画"])}': (int(row["名一笔画"]), int(row["名二笔画"]))
+        for row in selected_rows.to_dict(orient="records")
+    }
+
+    rows = []
+    for candidate in candidates:
+        combo = str(candidate.get("combo", "")).strip()
+        if combo not in combo_targets:
+            first_target = second_target = None
+            if combo_targets:
+                combo, (first_target, second_target) = next(iter(combo_targets.items()))
+        else:
+            first_target, second_target = combo_targets[combo]
+
+        first_char = str(candidate["first_char"])
+        second_char = str(candidate["second_char"])
+        first_info = lookup.get(first_char)
+        second_info = lookup.get(second_char)
+
+        first_strokes = first_info.get("name_strokes") if first_info else None
+        second_strokes = second_info.get("name_strokes") if second_info else None
+        first_ok = stroke_matches(first_strokes, first_target)
+        second_ok = stroke_matches(second_strokes, second_target)
+
+        rows.append(
+            {
+                "组合": combo,
+                "候选名字": f"{surname}{first_char}{second_char}" if surname else first_char + second_char,
+                "名一校验": "通过" if first_ok else ("不符" if first_info else "未收录"),
+                "名二校验": "通过" if second_ok else ("不符" if second_info else "未收录"),
+                "名一笔画": display_stroke(first_strokes),
+                "名二笔画": display_stroke(second_strokes),
+                "候选来源": candidate.get("candidate_source", ""),
+                "名一字库来源": first_info.get("source", "") if first_info else "",
+                "名二字库来源": second_info.get("source", "") if second_info else "",
+                "五行/读音": candidate.get("wuxing_pinyin", ""),
+                "推荐理由": candidate.get("reason", ""),
+                "注意事项": candidate.get("notes", ""),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=60)
+def get_codex_status() -> dict[str, str | bool]:
+    codex_path = shutil.which("codex")
+    if not codex_path:
+        return {"ready": False, "message": "未检测到 codex 命令。", "path": ""}
+
+    try:
+        result = subprocess.run(
+            [codex_path, "login", "status"],
+            cwd=APP_DIR,
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface local setup failures in the UI.
+        return {"ready": False, "message": f"无法检查 Codex 登录状态：{exc}", "path": codex_path}
+
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode == 0 and "Logged in" in output:
+        return {"ready": True, "message": output, "path": codex_path}
+
+    return {
+        "ready": False,
+        "message": output or "Codex 未登录。请先在 Terminal 运行 `codex login`。",
+        "path": codex_path,
+    }
+
+
+def build_selection_prompt(selected_rows: pd.DataFrame, preferences: str, surname: str) -> str:
+    combo_records = selected_rows[
+        [
+            "名一笔画",
+            "名二笔画",
+            "人格",
+            "地格",
+            "总格",
+            "夫妻关系",
+            "人际关系",
+            "人格天干",
+            "地格天干",
+            "总格天干",
+            "夫妻关系天干",
+            "人际关系天干",
+        ]
+    ].to_dict(orient="records")
+
+    return textwrap.dedent(
+        f"""
+        You are the character-selection model in a local Chinese naming workflow.
+
+        Context:
+        - This is a local personal naming helper.
+        - The web app has already calculated and filtered name-study stroke combinations.
+        - Your job is to gather stroke-matched candidate characters, then propose elegant Chinese given-name candidates.
+        - A deterministic local Python verifier will check name-study/Kangxi stroke counts after your response.
+        - Do not modify files.
+        - Use live web search when available.
+        - First try to find candidate characters by target stroke count from kangxizidian.com/kxbihua or page-specific Kangxi stroke URLs.
+        - Useful public Kangxi stroke indexes include https://www.kangxizidian.com.cn/bihua/{{stroke}}.html, https://www.kangxizidian.cn/bihua/, https://www.kangxizidian.org/bihua/index.html, and https://www.kangxizidian.net.cn/kangxi/bihua-{{stroke}}.html.
+        - Only query the selected stroke counts. Do not bulk crawl a full dictionary.
+        - Treat the public Kangxi pages as a candidate pool, not final verification.
+        - Exclude characters that are obviously unsuitable for naming: strongly negative meanings, illness/death/violence, vulgar use, extreme obscurity, hard registration risk, or awkward modern usage.
+        - Prefer entries marked as auspicious/common/name-appropriate when the source page provides such labels.
+        - Prefer modern, name-appropriate Chinese characters.
+        - Avoid obscure, hard-to-write, strongly negative, or legally awkward characters unless requested.
+        - Respect the user's preferences.
+
+        Surname:
+        {surname or "未填写"}
+
+        Selected stroke combinations as JSON:
+        {json.dumps(combo_records, ensure_ascii=False, indent=2)}
+
+        User naming preferences:
+        \"\"\"
+        {preferences.strip() or "无特别偏好。"}
+        \"\"\"
+
+        Task:
+        Return ONLY valid JSON. Do not wrap it in markdown.
+        Shape:
+        {{
+          "candidates": [
+            {{
+              "combo": "名一笔画-名二笔画",
+              "first_char": "单个汉字",
+              "second_char": "单个汉字",
+              "name": "两个字名",
+              "candidate_source": "简短说明候选来源，例如 kangxizidian.com.cn/bihua/8.html + /7.html；不确定则写未确认",
+              "wuxing_pinyin": "简要五行/读音倾向；不确定可留空",
+              "reason": "简短推荐理由",
+              "notes": "简短注意事项；没有则留空"
+            }}
+          ]
+        }}
+        Return 20-40 candidates total. Include multiple candidates for each selected combo.
+        """
+    ).strip()
+
+
+def summarize_codex_error(output: str, error: str) -> str:
+    raw = "\n\n".join(part for part in [output, error] if part).strip()
+    if not raw:
+        return "选字模型返回失败。"
+
+    if "requires a newer version of Codex" in raw:
+        return (
+            f"当前 Codex CLI 不支持模型 `{CODEX_AGENT_MODEL}`，需要升级 Codex 后才能使用。"
+            "可以先把环境变量 `NAME_SEARCH_CODEX_MODEL` 设为当前 CLI 支持的模型，再重启 Streamlit。"
+        )
+
+    if "not supported when using Codex with a ChatGPT account" in raw:
+        return (
+            f"当前 ChatGPT 登录方式不支持模型 `{CODEX_AGENT_MODEL}`。"
+            "请换成你的账号可用的 Codex 模型，或升级 Codex 后重试。"
+        )
+
+    if "tls handshake eof" in raw or "failed to connect to websocket" in raw:
+        return (
+            "Codex 连接 ChatGPT 服务时 TLS/WebSocket 握手失败。"
+            "这通常和当前网络、VPN、代理、防火墙或证书环境有关；CLI 会尝试 HTTPS fallback，"
+            "但这次没有成功完成请求。"
+        )
+
+    error_lines = [line for line in raw.splitlines() if "ERROR" in line or "error" in line.lower()]
+    if error_lines:
+        return "\n".join(error_lines[-8:])
+
+    return "\n".join(raw.splitlines()[-20:])
+
+
+def run_codex_selection(prompt: str, timeout_seconds: int = 240) -> tuple[bool, str]:
+    status = get_codex_status()
+    codex_path = str(status.get("path") or "")
+    if not codex_path:
+        return False, "未检测到 codex 命令。"
+
+    output_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="name-search-codex-", suffix=".txt", delete=False) as output_file:
+            output_path = Path(output_file.name)
+
+        result = subprocess.run(
+            [
+                codex_path,
+                "--search",
+                "exec",
+                "-m",
+                CODEX_AGENT_MODEL,
+                "-C",
+                str(APP_DIR),
+                "--ephemeral",
+                "--ignore-user-config",
+                "-s",
+                "read-only",
+                "--color",
+                "never",
+                "-o",
+                str(output_path),
+                "-",
+            ],
+            input=prompt,
+            cwd=APP_DIR,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"选字模型运行超过 {timeout_seconds} 秒，已停止。"
+    except Exception as exc:  # noqa: BLE001 - surface local execution failures.
+        return False, f"选字模型调用失败：{exc}"
+    finally:
+        last_message = ""
+        if output_path and output_path.exists():
+            last_message = output_path.read_text(encoding="utf-8", errors="replace").strip()
+            output_path.unlink(missing_ok=True)
+
+    output = (result.stdout or "").strip()
+    error = (result.stderr or "").strip()
+    if result.returncode != 0:
+        return False, summarize_codex_error(output, error)
+
+    return True, last_message or output or error or "选字模型没有返回内容。"
 
 
 st.set_page_config(page_title="姓名学取名遍历工具", layout="wide")
@@ -319,11 +808,93 @@ display_columns = [
 ]
 
 st.caption(f"找到 {len(filtered)} 组组合")
-st.dataframe(filtered[display_columns], width="stretch", hide_index=True)
+display_df = filtered[display_columns].copy()
+selection_df = display_df.copy()
+selection_df.insert(0, "选择", False)
+edited_selection = st.data_editor(
+    selection_df,
+    width="stretch",
+    hide_index=True,
+    disabled=display_columns,
+    column_config={
+        "选择": st.column_config.CheckboxColumn("选择", help="勾选后可交给本机 Codex workflow 生成候选汉字。")
+    },
+)
 
 st.download_button(
     "下载筛选结果 CSV",
-    data=filtered[display_columns].to_csv(index=False).encode("utf-8-sig"),
+    data=display_df.to_csv(index=False).encode("utf-8-sig"),
     file_name="name_search_results.csv",
     mime="text/csv",
 )
+
+st.subheader("AI 候选汉字")
+character_db = load_character_db()
+codex_status = get_codex_status()
+if codex_status["ready"]:
+    st.success("已检测到本机 ChatGPT 登录，可使用本地 Agent 生成候选名字")
+else:
+    st.warning(f"本地 workflow 功能未启用：{codex_status['message']}")
+    st.caption("请先在 Terminal 运行 `codex login`，然后刷新页面。")
+st.caption(f"当前选字模型：{CODEX_AGENT_MODEL}")
+
+if character_db.empty:
+    st.warning("未找到本地字库 `characters.csv`，生成结果只能标为未校验。")
+else:
+    st.caption(f"本地字库已加载 {len(character_db)} 个字；已完成姓名学笔画验证")
+
+selected_rows = edited_selection[edited_selection["选择"]].drop(columns=["选择"])
+preferences = st.text_area(
+    "名字偏好",
+    placeholder="例如：女孩名，清雅温柔；避免生僻字；希望带木/水意象；读音不要拗口；不要网红感。",
+    height=110,
+)
+
+selected_count = len(selected_rows)
+st.caption(f"已选择 {selected_count} 个笔画组合，最多建议一次选择 {MAX_AGENT_COMBOS} 个。")
+
+generate_disabled = (not codex_status["ready"]) or selected_count == 0 or selected_count > MAX_AGENT_COMBOS
+if selected_count > MAX_AGENT_COMBOS:
+    st.error(f"一次选择太多会让校验变慢。请先缩到 {MAX_AGENT_COMBOS} 个组合以内。")
+
+if st.button("生成候选", disabled=generate_disabled):
+    with st.spinner("Agent 正在按康熙笔画找候选字，随后小批量查美名腾并用本地代码校验..."):
+        prompt = build_selection_prompt(selected_rows, preferences, surname)
+        ok, agent_output = run_codex_selection(prompt)
+    if ok:
+        try:
+            with st.spinner("正在小批量查询美名腾并补充本地字库..."):
+                payload = extract_json_payload(agent_output)
+                candidates = normalize_candidate_payload(payload)
+                candidate_chars = collect_candidate_chars(candidates)
+                known_chars = set(character_db["char"].astype(str)) if not character_db.empty else set()
+                unknown_chars = [char for char in candidate_chars if char not in known_chars]
+                meimingteng_results = verify_meimingteng_chars(unknown_chars) if unknown_chars else []
+                upsert_count = upsert_verified_characters(meimingteng_results)
+                if upsert_count:
+                    character_db = load_character_db()
+                verified_df = verify_candidate_names(candidates, selected_rows, surname, character_db)
+        except Exception as exc:  # noqa: BLE001 - show parse/verification failures in the UI.
+            st.error(f"模型输出解析失败：{exc}")
+            st.code(agent_output)
+        else:
+            verified_count = sum(1 for row in meimingteng_results if row.get("verified"))
+            if unknown_chars:
+                verification_errors = sorted({str(row.get("error", "")) for row in meimingteng_results if row.get("error")})
+                st.caption(
+                    f"美名腾小批量验证：尝试 {min(len(unknown_chars), MAX_MEIMINGTENG_VERIFY_CHARS)} 个未知字，"
+                    f"确认 {verified_count} 个，写入/补全 {upsert_count} 处本地字库字段。"
+                )
+                if verification_errors:
+                    st.caption(f"外部验证失败示例：{verification_errors[0]}。已回落到本地字库结果。")
+                if len(unknown_chars) > MAX_MEIMINGTENG_VERIFY_CHARS:
+                    st.caption(f"另有 {len(unknown_chars) - MAX_MEIMINGTENG_VERIFY_CHARS} 个未知字本次未查询。")
+            st.dataframe(verified_df, width="stretch", hide_index=True)
+            st.download_button(
+                "下载候选名字 CSV",
+                data=verified_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="name_candidates.csv",
+                mime="text/csv",
+            )
+    else:
+        st.error(agent_output)

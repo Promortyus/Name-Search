@@ -19,3 +19,27 @@ streamlit run app.py
 - 人际关系 = 名二笔画 + 1
 
 天干五行阴阳按数字个位数映射：`1 甲木阳`、`2 乙木阴`、`3 丙火阳`、`4 丁火阴`、`5 戊土阳`、`6 己土阴`、`7 庚金阳`、`8 辛金阴`、`9 壬水阳`、`0 癸水阴`。
+
+## AI 候选名字
+
+页面下方的候选名字功能采用 workflow + harness：
+
+1. 本机 `codex --search exec` 根据勾选的笔画组合，优先从康熙笔画索引页按笔画找候选字。
+2. Agent 按名字偏好筛掉明显不适合取名的字，再组合成候选名字。
+3. 本地 harness 只对候选字做美名腾小批量事实查询，补充 `characters.csv`。
+4. 本地代码读取 `characters.csv`，用确定性字库校验每个候选字的姓名学笔画。
+
+默认选字模型是 `gpt-5.5`。如果本机 Codex 升级后想切到更强模型，可在启动 Streamlit 前设置：
+
+```bash
+export NAME_SEARCH_CODEX_MODEL=gpt-5.6-sol
+```
+
+`characters.csv` 字段：
+
+```csv
+char,name_strokes,wuxing,pinyin,source
+宛,8,土,wan,manual
+```
+
+`characters.csv` 可以增量维护：每次把美名腾或其他可信来源验证过的字加入本地字库。候选字不在 `characters.csv` 中时，结果会显示为“未收录”，不会假装校验通过。美名腾查询只用于当前候选字的小批量核验，不做全量抓取；如果外部站点拒绝命令行访问，工具会回落到本地字库，不绕过限制。
